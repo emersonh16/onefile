@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Derelict Drifters — Beam Modes with Range Scaling</title>
+  <title>Derelict Drifters — Beam + Miasma Grid + Sparkle</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     html, body { margin: 0; height: 100%; background: #0c0b10; overflow: hidden; }
@@ -13,7 +13,7 @@
   <canvas id="game"></canvas>
   <script>
     // -----------------------------
-    // CONFIG (easy knobs)
+    // CONFIG
     // -----------------------------
     const CONFIG = {
       playerRadius: 18,
@@ -29,40 +29,48 @@
       playerOutline: "rgba(0,0,0,0.35)",
 
       // Beam core
-      beamRange: 260,              // LASER length (kept as-is, farthest)
-      coneRangeMin: 160,           // CONE minimum reach at widest cone (< bubble)
-      beamHalfAngleDeg: 22,        // start half-angle
-      beamHalfAngleMin: 4,         // half-angle min (=> total 8°) -> laser
-      beamHalfAngleMax: 90,        // half-angle max (=> total 180°) allows bubble shrink map
-      wheelStepDeg: 6,             // faster wheel scroll
+      beamRange: 260,
+      coneRangeMin: 160,
+      beamHalfAngleDeg: 22,
+      beamHalfAngleMin: 4,
+      beamHalfAngleMax: 90,
+      wheelStepDeg: 6,
 
       // Visuals
       beamFill: "rgba(0, 255, 255, 0.18)",
       beamEdge: "rgba(0, 220, 255, 0.85)",
       beamEdgeWidth: 2,
 
-      // Laser look
-      laserWidth: 3,
-      laserGlowWidth: 8,
-      laserGlowAlpha: 0.18,
+      // Laser look (beefed up)
+      laserWidth: 5,
+      laserGlowWidth: 14,
+      laserGlowAlpha: 0.25,
 
-      // Bubble specifics (shorter than cone)
-      bubbleRMax: 120,             // bubble radius at 120° total
+      // Sparkle
+      sparkleSize: 12,
+      sparkleAlpha: 0.9,
+
+      // Bubble specifics
+      bubbleRMax: 120,
       bubbleEdgeWidth: 2,
       bubbleFill: "rgba(0, 255, 220, 0.14)",
       bubbleEdge: "rgba(0, 220, 200, 0.9)",
 
-      // Mode thresholds (TOTAL degrees)
-      laserTotalDeg: 8,            // <= 8° => laser
-      bubbleTotalDeg: 120          // >= 120° => bubble
+      // Mode thresholds
+      laserTotalDeg: 8,
+      bubbleTotalDeg: 120,
+
+      // Miasma grid
+      tile: 8,   // new standard pixel size
+      groundColor: "#3c4630",
+      miasmaColor: "rgba(180,0,255,0.85)"
     };
 
     // -----------------------------
-    // Canvas setup
+    // Canvas
     // -----------------------------
     const canvas = document.getElementById("game");
     const ctx = canvas.getContext("2d", { alpha: false });
-
     function resize() {
       canvas.width = Math.floor(window.innerWidth);
       canvas.height = Math.floor(window.innerHeight);
@@ -74,130 +82,121 @@
     // State
     // -----------------------------
     const state = {
-      time: 0,
-      dt: 0,
+      time: 0, dt: 0,
       keys: Object.create(null),
-      cam: { x: 0, y: 0 },     // camera/world offset
+      cam: { x: 0, y: 0 },
       mouse: { x: 0, y: 0, worldX: 0, worldY: 0 },
       beam: {
-        on: true,   // ALWAYS ON
+        on: true,
         halfAngle: toRad(CONFIG.beamHalfAngleDeg),
-        aimAngle: 0, // radians
-        mode: "cone", // "laser" | "cone" | "bubble"
+        aimAngle: 0,
+        mode: "cone",
         bubbleR: CONFIG.bubbleRMax,
-        effectiveRange: CONFIG.beamRange // dynamic per width for laser/cone
-      }
+        effectiveRange: CONFIG.beamRange
+      },
+      cols: 200,
+      rows: 200,
+      miasma: null
     };
+    state.miasma = new Uint8Array(state.cols * state.rows).fill(1);
 
     // -----------------------------
     // Input
     // -----------------------------
-    window.addEventListener("keydown", (e) => {
-      state.keys[e.key.toLowerCase()] = true;
-      if ([" ", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(e.key.toLowerCase())) {
-        e.preventDefault();
-      }
-    });
-    window.addEventListener("keyup", (e) => {
-      state.keys[e.key.toLowerCase()] = false;
-    });
+    window.addEventListener("keydown", (e) => { state.keys[e.key.toLowerCase()] = true; });
+    window.addEventListener("keyup", (e) => { state.keys[e.key.toLowerCase()] = false; });
 
     canvas.addEventListener("mousemove", (e) => {
       const rect = canvas.getBoundingClientRect();
       state.mouse.x = e.clientX - rect.left;
       state.mouse.y = e.clientY - rect.top;
-
       state.mouse.worldX = state.mouse.x + (state.cam.x - canvas.width / 2);
       state.mouse.worldY = state.mouse.y + (state.cam.y - canvas.height / 2);
-
-      const cx = canvas.width / 2;
-      const cy = canvas.height / 2;
+      const cx = canvas.width / 2, cy = canvas.height / 2;
       state.beam.aimAngle = Math.atan2(state.mouse.y - cy, state.mouse.x - cx);
     });
 
-    // Mouse wheel to widen/narrow beam (faster)
     window.addEventListener("wheel", (e) => {
       const delta = Math.sign(e.deltaY);
       const step = toRad(CONFIG.wheelStepDeg);
       state.beam.halfAngle -= delta * step;
-
-      const minA = toRad(CONFIG.beamHalfAngleMin);
-      const maxA = toRad(CONFIG.beamHalfAngleMax);
-      state.beam.halfAngle = clamp(state.beam.halfAngle, minA, maxA);
+      state.beam.halfAngle = clamp(state.beam.halfAngle, toRad(CONFIG.beamHalfAngleMin), toRad(CONFIG.beamHalfAngleMax));
       e.preventDefault();
     }, { passive: false });
 
     // -----------------------------
     // Update
     // -----------------------------
-    function update(dt) {
-      let vx = 0, vy = 0;
-      if (state.keys["w"]) vy -= 1;
-      if (state.keys["s"]) vy += 1;
-      if (state.keys["a"]) vx -= 1;
-      if (state.keys["d"]) vx += 1;
+ function update(dt) {
+  let vx = 0, vy = 0;
+  if (state.keys["w"]) vy -= 1;
+  if (state.keys["s"]) vy += 1;
+  if (state.keys["a"]) vx -= 1;
+  if (state.keys["d"]) vx += 1;
 
-      if (vx !== 0 || vy !== 0) {
-        const len = Math.hypot(vx, vy);
-        vx /= len; vy /= len;
-      }
+  if (vx !== 0 || vy !== 0) {
+    const len = Math.hypot(vx, vy);
+    vx /= len; vy /= len;
+  }
 
-      state.cam.x += vx * CONFIG.moveSpeed * dt;
-      state.cam.y += vy * CONFIG.moveSpeed * dt;
+  state.cam.x += vx * CONFIG.moveSpeed * dt;
+  state.cam.y += vy * CONFIG.moveSpeed * dt;
 
-      // Mode + range mapping
-      const totalDeg = toDeg(state.beam.halfAngle * 2);
+  // Beam mode + range mapping
+  const totalDeg = toDeg(state.beam.halfAngle * 2);
 
-      if (totalDeg <= CONFIG.laserTotalDeg) {
-        // LASER: farthest reach (keep your current length)
-        state.beam.mode = "laser";
-        state.beam.effectiveRange = CONFIG.beamRange;
+  if (totalDeg <= CONFIG.laserTotalDeg) {
+    state.beam.mode = "laser";
+    state.beam.effectiveRange = CONFIG.beamRange;
 
-      } else if (totalDeg >= CONFIG.bubbleTotalDeg) {
-        // BUBBLE: circle, shorter and shrinkable
-        state.beam.mode = "bubble";
-        // Map bubble radius: 120° => Rmax, 180° => 0
-        const maxTotal = CONFIG.beamHalfAngleMax * 2; // degrees
-        const t = clamp((totalDeg - CONFIG.bubbleTotalDeg) / (maxTotal - CONFIG.bubbleTotalDeg), 0, 1);
-        state.beam.bubbleR = CONFIG.bubbleRMax * (1 - t);
+  } else if (totalDeg >= CONFIG.bubbleTotalDeg) {
+    state.beam.mode = "bubble";
+    const maxTotal = CONFIG.beamHalfAngleMax * 2;
+    const t = clamp((totalDeg - CONFIG.bubbleTotalDeg) / (maxTotal - CONFIG.bubbleTotalDeg), 0, 1);
+    state.beam.bubbleR = CONFIG.bubbleRMax * (1 - t);
 
-      } else {
-        // CONE: range scales with width (narrower => farther)
-        state.beam.mode = "cone";
-        // Normalize width between laser and bubble thresholds
-        // t=0 at laser threshold (narrow) -> longest (beamRange)
-        // t=1 at bubble threshold (wide)  -> shortest (coneRangeMin)
-        const t = clamp((totalDeg - CONFIG.laserTotalDeg) / (CONFIG.bubbleTotalDeg - CONFIG.laserTotalDeg), 0, 1);
-        state.beam.effectiveRange = lerp(CONFIG.beamRange, CONFIG.coneRangeMin, t);
-      }
-    }
+  } else {
+    state.beam.mode = "cone";
+    const t = clamp((totalDeg - CONFIG.laserTotalDeg) / (CONFIG.bubbleTotalDeg - CONFIG.laserTotalDeg), 0, 1);
+    state.beam.effectiveRange = lerp(CONFIG.beamRange, CONFIG.coneRangeMin, t);
+  }
+
+  // -----------------------------
+  // NEW: Clear miasma under the beam
+  // -----------------------------
+  clearMiasmaWithBeam();
+}
+
 
     // -----------------------------
-    // Draw helpers
+    // Draw world + miasma
     // -----------------------------
-    function clearScreen() {
-      ctx.fillStyle = CONFIG.bgColor;
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-    }
+    function drawWorld() {
+      const { tile, groundColor, miasmaColor } = CONFIG;
+      const startCol = Math.floor((state.cam.x - canvas.width/2) / tile);
+      const startRow = Math.floor((state.cam.y - canvas.height/2) / tile);
+      const endCol = Math.floor((state.cam.x + canvas.width/2) / tile) + 1;
+      const endRow = Math.floor((state.cam.y + canvas.height/2) / tile) + 1;
 
-    function drawGrid() {
-      const { gridSize, gridColor } = CONFIG;
-      const w = canvas.width, h = canvas.height;
-      const ox = (-state.cam.x % gridSize + gridSize) % gridSize;
-      const oy = (-state.cam.y % gridSize + gridSize) % gridSize;
+      for (let row = startRow; row <= endRow; row++) {
+        for (let col = startCol; col <= endCol; col++) {
+          const idx = ((row % state.rows + state.rows) % state.rows) * state.cols + ((col % state.cols + state.cols) % state.cols);
+          const sx = col * tile - state.cam.x + canvas.width/2;
+          const sy = row * tile - state.cam.y + canvas.height/2;
 
-      ctx.strokeStyle = gridColor;
-      ctx.lineWidth = 1;
+          ctx.fillStyle = groundColor;
+          ctx.fillRect(sx, sy, tile, tile);
 
-      ctx.beginPath();
-      for (let x = ox; x <= w; x += gridSize) { ctx.moveTo(x, 0); ctx.lineTo(x, h); }
-      for (let y = oy; y <= h; y += gridSize) { ctx.moveTo(0, y); ctx.lineTo(w, y); }
-      ctx.stroke();
+          if (state.miasma[idx] === 1) {
+            ctx.fillStyle = miasmaColor;
+            ctx.fillRect(sx, sy, tile, tile);
+          }
+        }
+      }
     }
 
     function drawPlayer() {
-      const cx = canvas.width / 2;
-      const cy = canvas.height / 2;
+      const cx = canvas.width / 2, cy = canvas.height / 2;
       ctx.beginPath();
       ctx.arc(cx, cy, CONFIG.playerRadius, 0, Math.PI * 2);
       ctx.fillStyle = CONFIG.playerFill;
@@ -209,16 +208,12 @@
 
     function drawBeam() {
       if (!state.beam.on) return;
-
-      const cx = canvas.width / 2;
-      const cy = canvas.height / 2;
-      const a = state.beam.aimAngle;
-      const ha = state.beam.halfAngle;
+      const cx = canvas.width/2, cy = canvas.height/2;
+      const a = state.beam.aimAngle, ha = state.beam.halfAngle;
 
       if (state.beam.mode === "laser") {
         const r = state.beam.effectiveRange;
-        const lx = cx + Math.cos(a) * r;
-        const ly = cy + Math.sin(a) * r;
+        const lx = cx + Math.cos(a) * r, ly = cy + Math.sin(a) * r;
 
         // Glow
         ctx.save();
@@ -232,63 +227,65 @@
         ctx.lineWidth = CONFIG.laserWidth;
         ctx.strokeStyle = CONFIG.beamEdge;
         ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(lx, ly); ctx.stroke();
+
+        // Sparkle
+        const time = state.time * 6;
+        ctx.save();
+        ctx.translate(lx, ly);
+        ctx.rotate(time * 0.5);
+        ctx.globalAlpha = CONFIG.sparkleAlpha * (0.7 + 0.3 * Math.sin(time));
+        ctx.strokeStyle = CONFIG.beamEdge;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (let i = 0; i < 6; i++) {
+          const angle = (i * Math.PI / 3);
+          ctx.moveTo(0, 0);
+          ctx.lineTo(Math.cos(angle) * CONFIG.sparkleSize, Math.sin(angle) * CONFIG.sparkleSize);
+        }
+        ctx.stroke();
+        ctx.globalAlpha = 0.8;
+        ctx.fillStyle = CONFIG.beamEdge;
+        ctx.beginPath();
+        ctx.arc(0, 0, 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
         return;
       }
 
       if (state.beam.mode === "bubble") {
-        const br = state.beam.bubbleR;
-        if (br <= 0.5) return;
-        ctx.beginPath();
-        ctx.arc(cx, cy, br, 0, Math.PI * 2);
-        ctx.closePath();
-        ctx.fillStyle = CONFIG.bubbleFill;
-        ctx.fill();
+        const br = state.beam.bubbleR; if (br <= 0.5) return;
+        ctx.beginPath(); ctx.arc(cx, cy, br, 0, Math.PI * 2);
+        ctx.fillStyle = CONFIG.bubbleFill; ctx.fill();
         ctx.lineWidth = CONFIG.bubbleEdgeWidth;
-        ctx.strokeStyle = CONFIG.bubbleEdge;
-        ctx.stroke();
+        ctx.strokeStyle = CONFIG.bubbleEdge; ctx.stroke();
         return;
       }
 
-      // CONE
-      const r = state.beam.effectiveRange;
-      const a0 = a - ha;
-      const a1 = a + ha;
-
+      // Cone
+      const r = state.beam.effectiveRange, a0 = a - ha, a1 = a + ha;
+      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.arc(cx, cy, r, a0, a1);
+      ctx.closePath(); ctx.fillStyle = CONFIG.beamFill; ctx.fill();
+      ctx.lineWidth = CONFIG.beamEdgeWidth; ctx.strokeStyle = CONFIG.beamEdge;
       ctx.beginPath();
       ctx.moveTo(cx, cy);
-      ctx.arc(cx, cy, r, a0, a1);
-      ctx.closePath();
-      ctx.fillStyle = CONFIG.beamFill;
-      ctx.fill();
-
-      ctx.lineWidth = CONFIG.beamEdgeWidth;
-      ctx.strokeStyle = CONFIG.beamEdge;
-      ctx.beginPath();
+      ctx.lineTo(cx + Math.cos(a0)*r, cy + Math.sin(a0)*r);
       ctx.moveTo(cx, cy);
-      ctx.lineTo(cx + Math.cos(a0) * r, cy + Math.sin(a0) * r);
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(cx + Math.cos(a1) * r, cy + Math.sin(a1) * r);
+      ctx.lineTo(cx + Math.cos(a1)*r, cy + Math.sin(a1)*r);
       ctx.stroke();
-
-      ctx.beginPath();
-      ctx.arc(cx, cy, r, a0, a1);
-      ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, cy, r, a0, a1); ctx.stroke();
     }
 
     function drawHUD() {
       ctx.fillStyle = "rgba(255,255,255,0.85)";
-      ctx.font = "12px monospace";
-      ctx.textBaseline = "top";
+      ctx.font = "12px monospace"; ctx.textBaseline = "top";
       const fps = Math.round(1 / Math.max(0.0001, state.dt));
       const totalDeg = toDeg(state.beam.halfAngle * 2);
       ctx.fillText(`FPS: ${fps}`, 8, 8);
       ctx.fillText(`CAM: (${state.cam.x.toFixed(1)}, ${state.cam.y.toFixed(1)})`, 8, 24);
-
-      let mode = state.beam.mode.toUpperCase();
-      let extra = "";
-      if (mode === "BUBBLE") extra = ` | R=${Math.max(0, state.beam.bubbleR).toFixed(0)}`;
-      if (mode === "CONE")   extra = ` | range=${state.beam.effectiveRange.toFixed(0)}`;
-      if (mode === "LASER")  extra = ` | range=${state.beam.effectiveRange.toFixed(0)}`;
+      let mode = state.beam.mode.toUpperCase(), extra="";
+      if (mode==="BUBBLE") extra=` | R=${Math.max(0, state.beam.bubbleR).toFixed(0)}`;
+      if (mode==="CONE")   extra=` | range=${state.beam.effectiveRange.toFixed(0)}`;
+      if (mode==="LASER")  extra=` | range=${state.beam.effectiveRange.toFixed(0)}`;
       ctx.fillText(`Mode: ${mode} | width=${totalDeg.toFixed(0)}°${extra}`, 8, 40);
       ctx.fillText(`Wheel: width +/- ${CONFIG.wheelStepDeg}° per step`, 8, 56);
     }
@@ -299,14 +296,13 @@
     let last = performance.now();
     function loop(now) {
       state.dt = (now - last) / 1000; last = now;
-
+      state.time += state.dt;
       update(state.dt);
-      clearScreen();
-      drawGrid();
-      drawBeam();     // render beam under player for a nice look
+      ctx.fillStyle = CONFIG.bgColor; ctx.fillRect(0,0,canvas.width,canvas.height);
+      drawWorld();
+      drawBeam();
       drawPlayer();
       drawHUD();
-
       requestAnimationFrame(loop);
     }
     requestAnimationFrame(loop);
@@ -314,10 +310,93 @@
     // -----------------------------
     // Utils
     // -----------------------------
-    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
-    function toRad(deg) { return deg * Math.PI / 180; }
-    function toDeg(rad) { return rad * 180 / Math.PI; }
-    function lerp(a, b, t) { return a + (b - a) * t; }
+    function clamp(v,lo,hi){ return Math.max(lo,Math.min(hi,v)); }
+    function toRad(deg){ return deg*Math.PI/180; }
+    function toDeg(rad){ return rad*180/Math.PI; }
+    function lerp(a,b,t){ return a+(b-a)*t; }
+
+    // -----------------------------
+// Beam Hitbox + Collision Helpers
+// -----------------------------
+function getBeamHitbox() {
+  const cx = canvas.width/2, cy = canvas.height/2;
+  const a = state.beam.aimAngle, ha = state.beam.halfAngle;
+
+  if (state.beam.mode === "laser") {
+    const r = state.beam.effectiveRange;
+    const lx = cx + Math.cos(a) * r;
+    const ly = cy + Math.sin(a) * r;
+    return {
+      type: "line",
+      x1: cx, y1: cy,
+      x2: lx, y2: ly,
+      radius: CONFIG.laserGlowWidth * 1 // chunky thickness
+    };
+  }
+
+  if (state.beam.mode === "bubble") {
+    return { type:"circle", x:cx, y:cy, r: state.beam.bubbleR };
+  }
+
+  if (state.beam.mode === "cone") {
+    const r = state.beam.effectiveRange;
+    return { type:"cone", x:cx, y:cy, r, a0: a - ha, a1: a + ha };
+  }
+}
+
+// distance check for points
+function pointInBeam(x, y) {
+  const hb = getBeamHitbox();
+  if (!hb) return false;
+
+  if (hb.type === "circle") {
+    return ( (x-hb.x)**2 + (y-hb.y)**2 <= hb.r**2 );
+  }
+
+  if (hb.type === "line") {
+    const dx = hb.x2 - hb.x1, dy = hb.y2 - hb.y1;
+    const t = Math.max(0, Math.min(1, ((x-hb.x1)*dx + (y-hb.y1)*dy) / (dx*dx+dy*dy)));
+    const px = hb.x1 + t*dx, py = hb.y1 + t*dy;
+    const dist2 = (x-px)**2 + (y-py)**2;
+    return dist2 <= hb.radius**2;
+  }
+
+  if (hb.type === "cone") {
+    const dx = x - hb.x, dy = y - hb.y;
+    const dist2 = dx*dx + dy*dy;
+    if (dist2 > hb.r*hb.r) return false;
+    const ang = Math.atan2(dy, dx);
+    let diff = ang - hb.a0;
+    while (diff < 0) diff += Math.PI*2;
+    const arc = (hb.a1 - hb.a0 + Math.PI*2) % (Math.PI*2);
+    return diff <= arc;
+  }
+}
+
+// clears tiles under the beam
+function clearMiasmaWithBeam() {
+  const hb = getBeamHitbox();
+  if (!hb) return;
+
+  const { tile } = CONFIG;
+  const startCol = Math.floor((state.cam.x - canvas.width/2) / tile);
+  const startRow = Math.floor((state.cam.y - canvas.height/2) / tile);
+  const endCol = Math.floor((state.cam.x + canvas.width/2) / tile) + 1;
+  const endRow = Math.floor((state.cam.y + canvas.height/2) / tile) + 1;
+
+  for (let row = startRow; row <= endRow; row++) {
+    for (let col = startCol; col <= endCol; col++) {
+      const idx = ((row % state.rows + state.rows) % state.rows) * state.cols +
+                  ((col % state.cols + state.cols) % state.cols);
+      const cx = col * tile - state.cam.x + canvas.width/2 + tile/2;
+      const cy = row * tile - state.cam.y + canvas.height/2 + tile/2;
+      if (pointInBeam(cx, cy)) {
+        state.miasma[idx] = 0; // clear tile
+      }
+    }
+  }
+}
+
   </script>
 </body>
 </html>
