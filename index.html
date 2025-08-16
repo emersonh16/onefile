@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Derelict Drifters — Beam + Miasma Grid + Sparkle</title>
+  <title>Derelict Drifters — Evident Miasma (Seamless Wrap)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     html, body { margin: 0; height: 100%; background: #0c0b10; overflow: hidden; }
@@ -12,23 +12,21 @@
 <body>
   <canvas id="game"></canvas>
   <script>
-    // -----------------------------
-    // CONFIG
-    // -----------------------------
+    // ---------------------------------------
+    // CONFIG (easy knobs)
+    // ---------------------------------------
     const CONFIG = {
+      // Player + world
       playerRadius: 18,
       moveSpeed: 240,
-
-      // Visual grid
-      gridSize: 64,
-      gridColor: "rgba(255,255,255,0.06)",
       bgColor: "#0c0b10",
+      groundColor: "#3c4630",
+      worldRadius: 600,         // circular world radius (world px)
 
-      // Player look
-      playerFill: "#f5f5f5",
-      playerOutline: "rgba(0,0,0,0.35)",
+      // Pixel grid
+      tile: 4,                  // fog pixel -> rendered as 4x4 world px
 
-      // Beam core
+      // Beam core + visuals
       beamRange: 260,
       coneRangeMin: 160,
       beamHalfAngleDeg: 22,
@@ -36,39 +34,55 @@
       beamHalfAngleMax: 90,
       wheelStepDeg: 6,
 
-      // Visuals
       beamFill: "rgba(0, 255, 255, 0.18)",
       beamEdge: "rgba(0, 220, 255, 0.85)",
       beamEdgeWidth: 2,
-
-      // Laser look (beefed up)
       laserWidth: 5,
       laserGlowWidth: 14,
       laserGlowAlpha: 0.25,
-
-      // Sparkle
       sparkleSize: 12,
       sparkleAlpha: 0.9,
 
-      // Bubble specifics
       bubbleRMax: 120,
       bubbleEdgeWidth: 2,
       bubbleFill: "rgba(0, 255, 220, 0.14)",
       bubbleEdge: "rgba(0, 220, 200, 0.9)",
 
-      // Mode thresholds
       laserTotalDeg: 8,
       bubbleTotalDeg: 120,
 
-      // Miasma grid
-      tile: 8,   // new standard pixel size
-      groundColor: "#3c4630",
-      miasmaColor: "rgba(180,0,255,0.85)"
+      // Miasma color (RGBA bytes) — HIGHER ALPHA so it's really visible
+      miasmaColorRGBA: [180, 0, 255, Math.round(0.92 * 255)],
+
+      // --- Cloud sheet (finite) ---
+      sheetScale: 2.2,          // sheet size relative to world diameter
+      patchCount: 48,           // DENSE for obviousness; tune down later
+      patchRadiusMin: 28,       // in fog pixels
+      patchRadiusMax: 56,
+
+      // --- Wind behavior (fog px / s)
+      windSpeedMin: 40,
+      windSpeedMax: 80,
+      windEase: 1.5,            // how fast current wind follows target (per second)
+      windRetargetEvery: 14,    // small drift retarget (gentle turns)
+      gustIntervalMin: 32,      // dramatic & rare
+      gustIntervalMax: 55,
+      gustAngleMinDeg: 120,
+      gustSpeedBoost: 1.6,
+
+      // Respawn
+      spawnMargin: 120,
+
+      // --- Debug helpers ---
+      debug: {
+        alwaysCenterSpawn: true,
+        showSheetBounds: false   // <— turned OFF (no magenta box)
+      }
     };
 
-    // -----------------------------
+    // ---------------------------------------
     // Canvas
-    // -----------------------------
+    // ---------------------------------------
     const canvas = document.getElementById("game");
     const ctx = canvas.getContext("2d", { alpha: false });
     function resize() {
@@ -78,13 +92,13 @@
     window.addEventListener("resize", resize);
     resize();
 
-    // -----------------------------
+    // ---------------------------------------
     // State
-    // -----------------------------
+    // ---------------------------------------
     const state = {
       time: 0, dt: 0,
       keys: Object.create(null),
-      cam: { x: 0, y: 0 },
+      cam: { x: 0, y: 0 },                      // world coords of screen center
       mouse: { x: 0, y: 0, worldX: 0, worldY: 0 },
       beam: {
         on: true,
@@ -94,17 +108,39 @@
         bubbleR: CONFIG.bubbleRMax,
         effectiveRange: CONFIG.beamRange
       },
-      cols: 200,
-      rows: 200,
-      miasma: null
-    };
-    state.miasma = new Uint8Array(state.cols * state.rows).fill(1);
 
-    // -----------------------------
+      // Wind
+      wind: { vx: 0, vy: 0 },
+      windTarget: { vx: 0, vy: 0 },
+      smallTurnTimer: 0,
+      gustTimer: 0,
+      nextGustAt: 0,
+
+      // Fog sheet (finite buffer, drawn tiled)
+      sheet: null,              // {x,y,w,h}
+      sheetCanvas: null,
+      sheetCtx: null,
+      sheetImageData: null
+    };
+
+    // ---------------------------------------
+    // Derived sizes
+    // ---------------------------------------
+    const worldDiameter = CONFIG.worldRadius * 2;
+    const worldFogSize = Math.ceil(worldDiameter / CONFIG.tile);     // in fog pixels
+    const sheetFogSize = Math.ceil(worldFogSize * CONFIG.sheetScale);
+    const sheetWorldSizePx = sheetFogSize * CONFIG.tile;
+
+    // ---------------------------------------
+    // Create initial fog sheet
+    // ---------------------------------------
+    createSheet(randomAngle());
+
+    // ---------------------------------------
     // Input
-    // -----------------------------
+    // ---------------------------------------
     window.addEventListener("keydown", (e) => { state.keys[e.key.toLowerCase()] = true; });
-    window.addEventListener("keyup", (e) => { state.keys[e.key.toLowerCase()] = false; });
+    window.addEventListener("keyup",   (e) => { state.keys[e.key.toLowerCase()] = false; });
 
     canvas.addEventListener("mousemove", (e) => {
       const rect = canvas.getBoundingClientRect();
@@ -112,6 +148,7 @@
       state.mouse.y = e.clientY - rect.top;
       state.mouse.worldX = state.mouse.x + (state.cam.x - canvas.width / 2);
       state.mouse.worldY = state.mouse.y + (state.cam.y - canvas.height / 2);
+
       const cx = canvas.width / 2, cy = canvas.height / 2;
       state.beam.aimAngle = Math.atan2(state.mouse.y - cy, state.mouse.x - cx);
     });
@@ -124,85 +161,230 @@
       e.preventDefault();
     }, { passive: false });
 
-    // -----------------------------
-    // Update
-    // -----------------------------
- function update(dt) {
-  let vx = 0, vy = 0;
-  if (state.keys["w"]) vy -= 1;
-  if (state.keys["s"]) vy += 1;
-  if (state.keys["a"]) vx -= 1;
-  if (state.keys["d"]) vx += 1;
+    // ---------------------------------------
+    // Wind helpers
+    // ---------------------------------------
+    function setWindTarget(angle = randomAngle(), speed = randRange(CONFIG.windSpeedMin, CONFIG.windSpeedMax)) {
+      state.windTarget.vx = Math.cos(angle) * speed;
+      state.windTarget.vy = Math.sin(angle) * speed;
+    }
+    function scheduleNextGust() {
+      state.nextGustAt = randRange(CONFIG.gustIntervalMin, CONFIG.gustIntervalMax);
+      state.gustTimer = 0;
+    }
+    setWindTarget();      // initial small target
+    scheduleNextGust();   // schedule first gust later
 
-  if (vx !== 0 || vy !== 0) {
-    const len = Math.hypot(vx, vy);
-    vx /= len; vy /= len;
-  }
+    // ---------------------------------------
+    // Create a new fog sheet seeded with *patchy clouds*
+    // ---------------------------------------
+    function createSheet(incomingAngle) {
+      // offscreen canvas for the sheet
+      state.sheetCanvas = document.createElement('canvas');
+      state.sheetCanvas.width = sheetFogSize;
+      state.sheetCanvas.height = sheetFogSize;
+      state.sheetCtx = state.sheetCanvas.getContext('2d', { alpha: true });
+      state.sheetImageData = state.sheetCtx.createImageData(sheetFogSize, sheetFogSize);
 
-  state.cam.x += vx * CONFIG.moveSpeed * dt;
-  state.cam.y += vy * CONFIG.moveSpeed * dt;
+      // start fully clear
+      const img = state.sheetImageData.data;
+      for (let i = 0; i < sheetFogSize * sheetFogSize; i++) {
+        img[i*4 + 0] = 0;
+        img[i*4 + 1] = 0;
+        img[i*4 + 2] = 0;
+        img[i*4 + 3] = 0;
+      }
 
-  // Beam mode + range mapping
-  const totalDeg = toDeg(state.beam.halfAngle * 2);
+      // stamp patchy blobs (hard-edged circles for pixel style)
+      const [mr, mg, mb, ma] = CONFIG.miasmaColorRGBA;
+      const count = CONFIG.patchCount;
+      for (let p = 0; p < count; p++) {
+        const r  = randInt(CONFIG.patchRadiusMin, CONFIG.patchRadiusMax);
+        const cx = randInt(r, sheetFogSize - r - 1);
+        const cy = randInt(r, sheetFogSize - r - 1);
+        const r2 = r * r;
 
-  if (totalDeg <= CONFIG.laserTotalDeg) {
-    state.beam.mode = "laser";
-    state.beam.effectiveRange = CONFIG.beamRange;
-
-  } else if (totalDeg >= CONFIG.bubbleTotalDeg) {
-    state.beam.mode = "bubble";
-    const maxTotal = CONFIG.beamHalfAngleMax * 2;
-    const t = clamp((totalDeg - CONFIG.bubbleTotalDeg) / (maxTotal - CONFIG.bubbleTotalDeg), 0, 1);
-    state.beam.bubbleR = CONFIG.bubbleRMax * (1 - t);
-
-  } else {
-    state.beam.mode = "cone";
-    const t = clamp((totalDeg - CONFIG.laserTotalDeg) / (CONFIG.bubbleTotalDeg - CONFIG.laserTotalDeg), 0, 1);
-    state.beam.effectiveRange = lerp(CONFIG.beamRange, CONFIG.coneRangeMin, t);
-  }
-
-  // -----------------------------
-  // NEW: Clear miasma under the beam
-  // -----------------------------
-  clearMiasmaWithBeam();
-}
-
-
-    // -----------------------------
-    // Draw world + miasma
-    // -----------------------------
-    function drawWorld() {
-      const { tile, groundColor, miasmaColor } = CONFIG;
-      const startCol = Math.floor((state.cam.x - canvas.width/2) / tile);
-      const startRow = Math.floor((state.cam.y - canvas.height/2) / tile);
-      const endCol = Math.floor((state.cam.x + canvas.width/2) / tile) + 1;
-      const endRow = Math.floor((state.cam.y + canvas.height/2) / tile) + 1;
-
-      for (let row = startRow; row <= endRow; row++) {
-        for (let col = startCol; col <= endCol; col++) {
-          const idx = ((row % state.rows + state.rows) % state.rows) * state.cols + ((col % state.cols + state.cols) % state.cols);
-          const sx = col * tile - state.cam.x + canvas.width/2;
-          const sy = row * tile - state.cam.y + canvas.height/2;
-
-          ctx.fillStyle = groundColor;
-          ctx.fillRect(sx, sy, tile, tile);
-
-          if (state.miasma[idx] === 1) {
-            ctx.fillStyle = miasmaColor;
-            ctx.fillRect(sx, sy, tile, tile);
+        const y0 = Math.max(0, cy - r), y1 = Math.min(sheetFogSize - 1, cy + r);
+        for (let y = y0; y <= y1; y++) {
+          const dy = y - cy;
+          const dxMax = Math.floor(Math.sqrt(Math.max(0, r2 - dy*dy)));
+          const x0 = Math.max(0, cx - dxMax), x1 = Math.min(sheetFogSize - 1, cx + dxMax);
+          for (let x = x0; x <= x1; x++) {
+            const idx = (y * sheetFogSize + x) * 4;
+            img[idx + 0] = mr;
+            img[idx + 1] = mg;
+            img[idx + 2] = mb;
+            img[idx + 3] = ma; // alpha => visible
           }
         }
       }
+
+      state.sheetCtx.putImageData(state.sheetImageData, 0, 0);
+
+      // Spawn position (centered so you see it instantly)
+      state.sheet = {
+        x: -sheetWorldSizePx / 2,
+        y: -sheetWorldSizePx / 2,
+        w: sheetWorldSizePx,
+        h: sheetWorldSizePx
+      };
+    }
+
+    // ---------------------------------------
+    // Update
+    // ---------------------------------------
+    function update(dt) {
+      // Player movement
+      let vx = 0, vy = 0;
+      if (state.keys["w"]) vy -= 1;
+      if (state.keys["s"]) vy += 1;
+      if (state.keys["a"]) vx -= 1;
+      if (state.keys["d"]) vx += 1;
+      if (vx || vy) { const L = Math.hypot(vx, vy); vx /= L; vy /= L; }
+      state.cam.x += vx * CONFIG.moveSpeed * dt;
+      state.cam.y += vy * CONFIG.moveSpeed * dt;
+
+      // Clamp camera to world circle
+      const d = Math.hypot(state.cam.x, state.cam.y);
+      if (d > CONFIG.worldRadius) {
+        const s = CONFIG.worldRadius / d;
+        state.cam.x *= s; state.cam.y *= s;
+      }
+
+      // Beam modes
+      const totalDeg = toDeg(state.beam.halfAngle * 2);
+      if (totalDeg <= CONFIG.laserTotalDeg) {
+        state.beam.mode = "laser";
+        state.beam.effectiveRange = CONFIG.beamRange;
+      } else if (totalDeg >= CONFIG.bubbleTotalDeg) {
+        state.beam.mode = "bubble";
+        const maxTotal = CONFIG.beamHalfAngleMax * 2;
+        const t = clamp((totalDeg - CONFIG.bubbleTotalDeg) / (maxTotal - CONFIG.bubbleTotalDeg), 0, 1);
+        state.beam.bubbleR = CONFIG.bubbleRMax * (1 - t);
+      } else {
+        state.beam.mode = "cone";
+        const t = clamp((totalDeg - CONFIG.laserTotalDeg) / (CONFIG.bubbleTotalDeg - CONFIG.laserTotalDeg), 0, 1);
+        state.beam.effectiveRange = lerp(CONFIG.beamRange, CONFIG.coneRangeMin, t);
+      }
+
+      // --- Wind logic ---
+      state.smallTurnTimer += dt;
+      state.gustTimer += dt;
+
+      // soft retarget occasionally (gentle)
+      if (state.smallTurnTimer >= CONFIG.windRetargetEvery) {
+        state.smallTurnTimer = 0;
+        const curAng = Math.atan2(state.windTarget.vy, state.windTarget.vx);
+        const smallDelta = randRange(-Math.PI/6, Math.PI/6); // +/- 30°
+        const newAng = curAng + smallDelta;
+        const newSpeed = clamp(
+          Math.hypot(state.windTarget.vx, state.windTarget.vy) + randRange(-1, 1),
+          CONFIG.windSpeedMin,
+          CONFIG.windSpeedMax
+        );
+        setWindTarget(newAng, newSpeed);
+      }
+
+      // rare dramatic gust
+      if (state.gustTimer >= state.nextGustAt) {
+        state.gustTimer = 0;
+        scheduleNextGust();
+
+        // big angle swing
+        const curAng = Math.atan2(state.wind.vy, state.wind.vx);
+        const turn = toRad(randRange(CONFIG.gustAngleMinDeg, 180)) * (Math.random() < 0.5 ? -1 : 1);
+        const newAng = curAng + turn;
+
+        // spike speed
+        const base = randRange(CONFIG.windSpeedMin, CONFIG.windSpeedMax);
+        const boosted = Math.min(base * CONFIG.gustSpeedBoost, CONFIG.windSpeedMax);
+        setWindTarget(newAng, boosted);
+      }
+
+      // ease current wind toward target
+      const k = Math.min(1, CONFIG.windEase * dt);
+      state.wind.vx += (state.windTarget.vx - state.wind.vx) * k;
+      state.wind.vy += (state.windTarget.vy - state.wind.vy) * k;
+
+      // move the sheet in world PX (wind is in fog px/s → multiply by tile)
+      if (state.sheet) {
+        state.sheet.x += state.wind.vx * CONFIG.tile * dt;
+        state.sheet.y += state.wind.vy * CONFIG.tile * dt;
+      }
+
+      // Carve holes under beam (in sheet pixel space, with wrap)
+      clearMiasmaWithBeam();
+
+      // NOTE: no respawn needed; we draw tiled with wrap now.
+      // maybeRespawnSheet(); // <-- removed
+    }
+
+    // ---------------------------------------
+    // Draw
+    // ---------------------------------------
+    function drawWorld() {
+      ctx.save();
+      // clip to circular world centered at (0,0)
+      ctx.beginPath();
+      ctx.arc(canvas.width/2 - state.cam.x, canvas.height/2 - state.cam.y, CONFIG.worldRadius, 0, Math.PI*2);
+      ctx.clip();
+
+      // ground fill
+      const worldLeft = -CONFIG.worldRadius - state.cam.x + canvas.width/2;
+      const worldTop  = -CONFIG.worldRadius - state.cam.y + canvas.height/2;
+      const worldSize = CONFIG.worldRadius * 2;
+      ctx.fillStyle = CONFIG.groundColor;
+      ctx.fillRect(worldLeft, worldTop, worldSize, worldSize);
+
+      // draw the drifting sheet as a seamless tile (wrap)
+      if (state.sheet) {
+        ctx.imageSmoothingEnabled = false;
+
+        const tileW = state.sheet.w;
+        const tileH = state.sheet.h;
+
+        // offset sheet position relative to camera, wrapped into [0,tile)
+        const baseDx = ((state.sheet.x - state.cam.x + canvas.width  / 2) % tileW + tileW) % tileW;
+        const baseDy = ((state.sheet.y - state.cam.y + canvas.height / 2) % tileH + tileH) % tileH;
+
+        // draw a 3×3 grid around the base tile to cover the world circle
+        for (let oy = -1; oy <= 1; oy++) {
+          for (let ox = -1; ox <= 1; ox++) {
+            const dx = baseDx + ox * tileW;
+            const dy = baseDy + oy * tileH;
+            ctx.drawImage(
+              state.sheetCanvas,
+              0, 0, sheetFogSize, sheetFogSize,
+              dx, dy, tileW, tileH
+            );
+          }
+        }
+
+        if (CONFIG.debug.showSheetBounds) {
+          ctx.strokeStyle = "magenta";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(baseDx, baseDy, tileW, tileH);
+        }
+      }
+
+      ctx.restore();
+
+      // Border ring
+      ctx.beginPath();
+      ctx.arc(canvas.width/2 - state.cam.x, canvas.height/2 - state.cam.y, CONFIG.worldRadius, 0, Math.PI*2);
+      ctx.strokeStyle = "rgba(255,255,255,0.25)";
+      ctx.lineWidth = 4;
+      ctx.stroke();
     }
 
     function drawPlayer() {
       const cx = canvas.width / 2, cy = canvas.height / 2;
       ctx.beginPath();
       ctx.arc(cx, cy, CONFIG.playerRadius, 0, Math.PI * 2);
-      ctx.fillStyle = CONFIG.playerFill;
+      ctx.fillStyle = "#f5f5f5";
       ctx.fill();
       ctx.lineWidth = 2;
-      ctx.strokeStyle = CONFIG.playerOutline;
+      ctx.strokeStyle = "rgba(0,0,0,0.35)";
       ctx.stroke();
     }
 
@@ -238,9 +420,9 @@
         ctx.lineWidth = 2;
         ctx.beginPath();
         for (let i = 0; i < 6; i++) {
-          const angle = (i * Math.PI / 3);
+          const ang = i * Math.PI / 3;
           ctx.moveTo(0, 0);
-          ctx.lineTo(Math.cos(angle) * CONFIG.sparkleSize, Math.sin(angle) * CONFIG.sparkleSize);
+          ctx.lineTo(Math.cos(ang) * CONFIG.sparkleSize, Math.sin(ang) * CONFIG.sparkleSize);
         }
         ctx.stroke();
         ctx.globalAlpha = 0.8;
@@ -287,115 +469,146 @@
       if (mode==="CONE")   extra=` | range=${state.beam.effectiveRange.toFixed(0)}`;
       if (mode==="LASER")  extra=` | range=${state.beam.effectiveRange.toFixed(0)}`;
       ctx.fillText(`Mode: ${mode} | width=${totalDeg.toFixed(0)}°${extra}`, 8, 40);
-      ctx.fillText(`Wheel: width +/- ${CONFIG.wheelStepDeg}° per step`, 8, 56);
+
+      const spd = Math.hypot(state.wind.vx, state.wind.vy);
+      const angDeg = toDeg(Math.atan2(state.wind.vy, state.wind.vx));
+      ctx.fillText(`Wind: ${spd.toFixed(2)} px/s @ ${Math.round((angDeg+360)%360)}°`, 8, 56);
     }
 
-    // -----------------------------
+    // ---------------------------------------
     // Main loop
-    // -----------------------------
+    // ---------------------------------------
     let last = performance.now();
     function loop(now) {
       state.dt = (now - last) / 1000; last = now;
       state.time += state.dt;
+
       update(state.dt);
-      ctx.fillStyle = CONFIG.bgColor; ctx.fillRect(0,0,canvas.width,canvas.height);
+
+      ctx.fillStyle = CONFIG.bgColor;
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+
       drawWorld();
       drawBeam();
       drawPlayer();
       drawHUD();
+
       requestAnimationFrame(loop);
     }
     requestAnimationFrame(loop);
 
-    // -----------------------------
-    // Utils
-    // -----------------------------
-    function clamp(v,lo,hi){ return Math.max(lo,Math.min(hi,v)); }
-    function toRad(deg){ return deg*Math.PI/180; }
-    function toDeg(rad){ return rad*180/Math.PI; }
-    function lerp(a,b,t){ return a+(b-a)*t; }
+    // ---------------------------------------
+    // Clear miasma in SHEET PIXEL SPACE (with WRAP)
+    // ---------------------------------------
+    function clearMiasmaWithBeam() {
+      if (!state.sheet) return;
 
-    // -----------------------------
-// Beam Hitbox + Collision Helpers
-// -----------------------------
-function getBeamHitbox() {
-  const cx = canvas.width/2, cy = canvas.height/2;
-  const a = state.beam.aimAngle, ha = state.beam.halfAngle;
+      const hb = getBeamHitbox();
+      if (!hb) return;
 
-  if (state.beam.mode === "laser") {
-    const r = state.beam.effectiveRange;
-    const lx = cx + Math.cos(a) * r;
-    const ly = cy + Math.sin(a) * r;
-    return {
-      type: "line",
-      x1: cx, y1: cy,
-      x2: lx, y2: ly,
-      radius: CONFIG.laserGlowWidth * 1 // chunky thickness
-    };
-  }
+      const tile = CONFIG.tile;
 
-  if (state.beam.mode === "bubble") {
-    return { type:"circle", x:cx, y:cy, r: state.beam.bubbleR };
-  }
+      // visible area bounds in SHEET coordinates (unwrapped; can be any integer)
+      const startCol = Math.floor(((state.cam.x - canvas.width/2) - state.sheet.x) / tile);
+      const startRow = Math.floor(((state.cam.y - canvas.height/2) - state.sheet.y) / tile);
+      const endCol   = Math.floor(((state.cam.x + canvas.width/2) - state.sheet.x) / tile) + 1;
+      const endRow   = Math.floor(((state.cam.y + canvas.height/2) - state.sheet.y) / tile) + 1;
 
-  if (state.beam.mode === "cone") {
-    const r = state.beam.effectiveRange;
-    return { type:"cone", x:cx, y:cy, r, a0: a - ha, a1: a + ha };
-  }
-}
+      const img = state.sheetImageData.data;
+      let any = false;
 
-// distance check for points
-function pointInBeam(x, y) {
-  const hb = getBeamHitbox();
-  if (!hb) return false;
+      for (let row = startRow; row <= endRow; row++) {
+        for (let col = startCol; col <= endCol; col++) {
+          // wrap indices into [0, sheetFogSize)
+          const wrapRow = ((row % sheetFogSize) + sheetFogSize) % sheetFogSize;
+          const wrapCol = ((col % sheetFogSize) + sheetFogSize) % sheetFogSize;
 
-  if (hb.type === "circle") {
-    return ( (x-hb.x)**2 + (y-hb.y)**2 <= hb.r**2 );
-  }
+          // world center for this fog pixel (use *unwrapped* row/col for position)
+          const worldX = state.sheet.x + col * tile + tile / 2;
+          const worldY = state.sheet.y + row * tile + tile / 2;
 
-  if (hb.type === "line") {
-    const dx = hb.x2 - hb.x1, dy = hb.y2 - hb.y1;
-    const t = Math.max(0, Math.min(1, ((x-hb.x1)*dx + (y-hb.y1)*dy) / (dx*dx+dy*dy)));
-    const px = hb.x1 + t*dx, py = hb.y1 + t*dy;
-    const dist2 = (x-px)**2 + (y-py)**2;
-    return dist2 <= hb.radius**2;
-  }
+          // world → screen for hit test
+          const sx = worldX - state.cam.x + canvas.width / 2;
+          const sy = worldY - state.cam.y + canvas.height / 2;
 
-  if (hb.type === "cone") {
-    const dx = x - hb.x, dy = y - hb.y;
-    const dist2 = dx*dx + dy*dy;
-    if (dist2 > hb.r*hb.r) return false;
-    const ang = Math.atan2(dy, dx);
-    let diff = ang - hb.a0;
-    while (diff < 0) diff += Math.PI*2;
-    const arc = (hb.a1 - hb.a0 + Math.PI*2) % (Math.PI*2);
-    return diff <= arc;
-  }
-}
+          if (!pointInBeam(sx, sy)) continue;
 
-// clears tiles under the beam
-function clearMiasmaWithBeam() {
-  const hb = getBeamHitbox();
-  if (!hb) return;
+          const idx = (wrapRow * sheetFogSize + wrapCol) * 4;
+          if (img[idx + 3] === 0) continue; // already clear
+          img[idx + 3] = 0; // alpha clear
+          any = true;
+        }
+      }
 
-  const { tile } = CONFIG;
-  const startCol = Math.floor((state.cam.x - canvas.width/2) / tile);
-  const startRow = Math.floor((state.cam.y - canvas.height/2) / tile);
-  const endCol = Math.floor((state.cam.x + canvas.width/2) / tile) + 1;
-  const endRow = Math.floor((state.cam.y + canvas.height/2) / tile) + 1;
+      if (any) state.sheetCtx.putImageData(state.sheetImageData, 0, 0);
+    }
 
-  for (let row = startRow; row <= endRow; row++) {
-    for (let col = startCol; col <= endCol; col++) {
-      const idx = ((row % state.rows + state.rows) % state.rows) * state.cols +
-                  ((col % state.cols + state.cols) % state.cols);
-      const cx = col * tile - state.cam.x + canvas.width/2 + tile/2;
-      const cy = row * tile - state.cam.y + canvas.height/2 + tile/2;
-      if (pointInBeam(cx, cy)) {
-        state.miasma[idx] = 0; // clear tile
+    // ---------------------------------------
+    // (No longer used) Despawn/respawn logic for finite sheet
+    // ---------------------------------------
+    function maybeRespawnSheet() {
+      // kept for reference; not called in seamless wrap mode
+    }
+
+    // ---------------------------------------
+    // Beam Hitbox + Collision
+    // ---------------------------------------
+    function getBeamHitbox() {
+      const cx = canvas.width/2, cy = canvas.height/2;
+      const a = state.beam.aimAngle, ha = state.beam.halfAngle;
+
+      if (state.beam.mode === "laser") {
+        const r = state.beam.effectiveRange;
+        const lx = cx + Math.cos(a) * r;
+        const ly = cy + Math.sin(a) * r;
+        return { type: "line", x1: cx, y1: cy, x2: lx, y2: ly, radius: CONFIG.laserGlowWidth * 1 };
+      }
+      if (state.beam.mode === "bubble") {
+        return { type:"circle", x:cx, y:cy, r: state.beam.bubbleR };
+      }
+      if (state.beam.mode === "cone") {
+        const r = state.beam.effectiveRange;
+        return { type:"cone", x:cx, y:cy, r, a0: a - ha, a1: a + ha };
       }
     }
-  }
-}
+
+    function pointInBeam(x, y) {
+      const hb = getBeamHitbox();
+      if (!hb) return false;
+
+      if (hb.type === "circle") {
+        return ((x-hb.x)**2 + (y-hb.y)**2 <= hb.r**2);
+      }
+      if (hb.type === "line") {
+        const dx = hb.x2 - hb.x1, dy = hb.y2 - hb.y1;
+        const t = Math.max(0, Math.min(1, ((x-hb.x1)*dx + (y-hb.y1)*dy) / (dx*dx+dy*dy)));
+        const px = hb.x1 + t*dx, py = hb.y1 + t*dy;
+        const dist2 = (x-px)**2 + (y-py)**2;
+        return dist2 <= hb.radius**2;
+      }
+      if (hb.type === "cone") {
+        const dx = x - hb.x, dy = y - hb.y;
+        const dist2 = dx*dx + dy*dy;
+        if (dist2 > hb.r*hb.r) return false;
+        const ang = Math.atan2(dy, dx);
+        let diff = ang - hb.a0;
+        while (diff < 0) diff += Math.PI*2;
+        const arc = (hb.a1 - hb.a0 + Math.PI*2) % (Math.PI*2);
+        return diff <= arc;
+      }
+    }
+
+    // ---------------------------------------
+    // Utils
+    // ---------------------------------------
+    function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+    function toRad(deg){ return deg * Math.PI / 180; }
+    function toDeg(rad){ return rad * 180 / Math.PI; }
+    function lerp(a,b,t){ return a + (b-a) * t; }
+    function randRange(a,b){ return a + Math.random() * (b - a); }
+    function randInt(a,b){ return Math.floor(randRange(a, b+1)); }
+    function randomAngle(){ return Math.random() * Math.PI * 2; }
+    function unitFromAngle(a){ return { x: Math.cos(a), y: Math.sin(a) }; }
 
   </script>
 </body>
